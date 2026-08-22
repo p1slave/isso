@@ -5,13 +5,20 @@ import json
 import smtplib
 import socket
 import time
+import re
 
 from _thread import start_new_thread
 from email.message import EmailMessage
 from email.utils import formatdate
-from urllib.parse import quote
+from urllib.error import URLError
+from urllib.parse import quote, urlencode
+from urllib.request import urlopen
 
 import logging
+
+from werkzeug.exceptions import Forbidden
+from werkzeug.routing import Rule
+from werkzeug.wrappers import Response
 
 logger = logging.getLogger("isso")
 
@@ -213,6 +220,114 @@ class SMTP(object):
                 time.sleep(60)
             else:
                 break
+
+
+class Telegram(object):
+    reply_marker = re.compile(r"\[isso-comment:(\d+)\]")
+
+    def __init__(self, isso):
+        self.isso = isso
+        self.conf = isso.conf.section("telegram")
+        self.token = self.conf.get("token")
+        self.chat_id = self.conf.get("chat-id")
+        self.webhook_secret = self.conf.get("webhook-secret")
+        self.isso.urls.add(Rule("/telegram/webhook", endpoint=self.webhook, methods=["POST"]))
+        self.webhook_url = (isso.conf.get("server", "public-endpoint").rstrip("/") + "/telegram/webhook")
+        if self.token and self.webhook_secret and self.webhook_url != "/telegram/webhook":
+            self.set_webhook()
+        else:
+            logger.warning("Telegram webhook is not registered: configure token, webhook-secret, and server.public-endpoint")
+
+    def __iter__(self):
+        yield "comments.new:after-save", self.notify_new
+
+    def notify_new(self, thread, comment):
+        if comment["remote_addr"].startswith("telegram:"):
+            return
+
+        author = comment["author"] or "Anonymous"
+        title = thread["title"] or thread["uri"]
+        url = local("origin") + thread["uri"] + "#isso-%i" % comment["id"]
+        text = "New comment on %s\n\n%s wrote:\n%s\n\n%s\n[isso-comment:%i]" % (
+            title,
+            author,
+            comment["text"],
+            url,
+            comment["id"],
+        )
+        self.send(text)
+
+    def send(self, text):
+        # Telegram limits text messages to 4096 characters.
+        text = text[:4096]
+        data = urlencode({"chat_id": self.chat_id, "text": text}).encode("utf-8")
+        try:
+            with urlopen(
+                "https://api.telegram.org/bot%s/sendMessage" % self.token,
+                data=data,
+                timeout=self.conf.getint("timeout"),
+            ):
+                pass
+        except URLError:
+            logger.exception("unable to send Telegram notification")
+
+    def set_webhook(self):
+        data = urlencode(
+            {
+                "url": self.webhook_url,
+                "secret_token": self.webhook_secret,
+                "allowed_updates": json.dumps(["message"]),
+            }
+        ).encode("utf-8")
+
+        try:
+            with urlopen(
+                "https://api.telegram.org/bot%s/setWebhook" % self.token,
+                data=data,
+                timeout=self.conf.getint("timeout"),
+            ) as response:
+                result = json.load(response)
+        except (URLError, ValueError):
+            logger.exception("unable to register Telegram webhook")
+            return
+
+        if not result.get("ok"):
+            logger.error("unable to register Telegram webhook: %s", result.get("description", "unknown error"))
+
+    def webhook(self, environ, request):
+        if not self.webhook_secret or request.headers.get("X-Telegram-Bot-Api-Secret-Token") != self.webhook_secret:
+            raise Forbidden()
+
+        update = request.get_json()
+        message = update.get("message", {})
+        if str(message.get("chat", {}).get("id")) != self.chat_id:
+            raise Forbidden()
+
+        text = message.get("text")
+        reply = message.get("reply_to_message", {})
+        marker = self.reply_marker.search(reply.get("text", ""))
+        if not text or marker is None:
+            return Response(status=200)
+
+        parent = self.isso.db.comments.get(int(marker.group(1)))
+        if parent is None:
+            return Response(status=200)
+
+        thread = self.isso.db.threads.get(parent["tid"])
+        with self.isso.lock:
+            comment = self.isso.db.comments.add(
+                thread["uri"],
+                {
+                    "parent": parent["id"],
+                    "mode": 1,
+                    "remote_addr": "telegram:%s" % self.chat_id,
+                    "text": text,
+                    "author": self.conf.get("author"),
+                    "notification": False,
+                },
+            )
+        self.isso.signal("comments.new:after-save", thread, comment)
+        return Response(status=200)
 
 
 class Stdout(object):

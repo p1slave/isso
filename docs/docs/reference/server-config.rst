@@ -103,7 +103,42 @@ notify
         Send notifications via SMTP on new comments with activation (if
         moderated) and deletion links.
 
+    telegram
+        Send new-comment notifications to a Telegram chat. Reply to a bot
+        notification to post an approved reply to that comment.
+
     Default: ``stdout``
+
+.. _configure-telegram:
+
+Telegram
+--------
+
+Telegram notifications require a bot created with `BotFather
+<https://t.me/BotFather>`_. Add ``telegram`` to ``general.notify``, then
+configure the bot token, the numeric ID of the permitted chat, and a high
+entropy webhook secret.
+
+.. code-block:: ini
+
+    [general]
+    notify = telegram
+
+    [telegram]
+    token = 123456:bot-token
+    chat-id = 1001234567890
+    webhook-secret = a-long-random-secret
+    author = Site administrator
+    timeout = 10
+
+On startup, Isso registers the webhook at
+``server.public-endpoint/telegram/webhook``. The ``secret_token`` sent to
+Telegram exactly matches ``webhook-secret``. The public endpoint must be an
+externally reachable HTTPS URL.
+
+Only messages from ``chat-id`` and webhook requests containing this secret are
+accepted. Telegram replies are published immediately as ``author``; they do
+not enter the moderation queue.
 
 reply-notifications
     Allow users to request E-mail notifications for replies to their post.
